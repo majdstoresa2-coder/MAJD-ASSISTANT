@@ -126,7 +126,7 @@ APP_NAME = "MAJD Assistant"
 APP_NAME_AR = "مساعد مجد"
 
 RUNTIME_NAME = "MAJD Assistant Autonomous Runtime"
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.0.1"
 
 CORE_FILENAME = "MAJD-ASSISTANT-CORE-01.py"
 RUNTIME_FILENAME = "MAJD-ASSISTANT-AUTONOMOUS-RUNTIME-02.py"
@@ -194,6 +194,32 @@ MAX_REPAIR_ATTEMPTS = max(
 COMMAND_TIMEOUT = max(
     5,
     int(os.environ.get("MAJD_COMMAND_TIMEOUT", "180")),
+)
+
+DEVELOPMENT_GATEWAY_TIMEOUT = max(
+    60,
+    min(
+        3600,
+        int(
+            os.environ.get(
+                "MAJD_DEVELOPMENT_GATEWAY_TIMEOUT",
+                "600",
+            )
+        ),
+    ),
+)
+
+DEVELOPMENT_HEALTH_TIMEOUT = max(
+    3,
+    min(
+        60,
+        int(
+            os.environ.get(
+                "MAJD_DEVELOPMENT_HEALTH_TIMEOUT",
+                "10",
+            )
+        ),
+    ),
 )
 
 MAX_GENERATED_FILE_BYTES = max(
@@ -1543,11 +1569,13 @@ class DependencyManager:
 
 class DevelopmentGateway:
     """
-    Talks to a MAJD-compatible development gateway.
+    Talks to the local MAJD AI development engine.
 
     Environment:
         MAJD_DEVELOPMENT_GATEWAY_URL
         MAJD_DEVELOPMENT_GATEWAY_TOKEN
+        MAJD_DEVELOPMENT_GATEWAY_TIMEOUT
+        MAJD_DEVELOPMENT_HEALTH_TIMEOUT
 
     Expected:
         GET  /health
@@ -1567,6 +1595,16 @@ class DevelopmentGateway:
             "MAJD_DEVELOPMENT_GATEWAY_TOKEN",
             "",
         )
+
+        self.development_timeout = (
+            DEVELOPMENT_GATEWAY_TIMEOUT
+        )
+
+        self.health_timeout = (
+            DEVELOPMENT_HEALTH_TIMEOUT
+        )
+
+        self.last_error: Optional[str] = None
 
     @property
     def configured(self) -> bool:
@@ -1595,7 +1633,13 @@ class DevelopmentGateway:
         payload: Optional[
             Dict[str, Any]
         ] = None,
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
+        if not self.configured:
+            raise RuntimeError(
+                "DEVELOPMENT_GATEWAY_NOT_CONFIGURED"
+            )
+
         url = (
             f"{self.base_url}"
             f"{endpoint}"
@@ -1616,42 +1660,287 @@ class DevelopmentGateway:
             method=method,
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=60,
-        ) as response:
-            raw = response.read(
-                MAX_GENERATED_FILE_BYTES
-                + 500000
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else self.development_timeout
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=effective_timeout,
+            ) as response:
+                raw = response.read(
+                    MAX_GENERATED_FILE_BYTES
+                    + 500000
+                )
+
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read(
+                    200000
+                ).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            except Exception:
+                body = ""
+
+            self.last_error = (
+                f"HTTP_ERROR:{exc.code}:"
+                f"{SecretGuard.redact(body)}"
             )
+
+            raise RuntimeError(
+                self.last_error
+            ) from exc
+
+        except urllib.error.URLError as exc:
+            self.last_error = (
+                "URL_ERROR:"
+                f"{SecretGuard.redact(str(exc.reason))}"
+            )
+
+            raise RuntimeError(
+                self.last_error
+            ) from exc
+
+        except TimeoutError as exc:
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_TIMEOUT:"
+                f"{effective_timeout}"
+            )
+
+            raise RuntimeError(
+                self.last_error
+            ) from exc
+
+        except Exception as exc:
+            self.last_error = (
+                f"{type(exc).__name__}:"
+                f"{SecretGuard.redact(str(exc))}"
+            )
+            raise
 
         if (
             len(raw)
             > MAX_GENERATED_FILE_BYTES
             + 500000
         ):
-            raise ValueError(
-                "Development response too large"
+            self.last_error = (
+                "DEVELOPMENT_RESPONSE_TOO_LARGE"
             )
 
-        return json.loads(
-            raw.decode("utf-8")
-        )
+            raise ValueError(
+                self.last_error
+            )
+
+        try:
+            result = json.loads(
+                raw.decode("utf-8")
+            )
+        except Exception as exc:
+            self.last_error = (
+                "INVALID_DEVELOPMENT_JSON"
+            )
+
+            raise ValueError(
+                self.last_error
+            ) from exc
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            self.last_error = (
+                "INVALID_DEVELOPMENT_RESPONSE"
+            )
+
+            raise ValueError(
+                self.last_error
+            )
+
+        self.last_error = None
+
+        return result
 
     def healthy(self) -> bool:
         if not self.configured:
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_NOT_CONFIGURED"
+            )
             return False
 
         try:
             result = self._json_request(
                 "GET",
                 "/health",
+                timeout=self.health_timeout,
             )
-            return bool(
+
+            ok = bool(
                 result.get("ok")
             )
-        except Exception:
+
+            if not ok:
+                self.last_error = (
+                    "DEVELOPMENT_GATEWAY_UNHEALTHY"
+                )
+
+            return ok
+
+        except Exception as exc:
+            if not self.last_error:
+                self.last_error = (
+                    f"{type(exc).__name__}: "
+                    f"{SecretGuard.redact(str(exc))}"
+                )
+
             return False
+
+    @staticmethod
+    def _extract_development_result(
+        response: Mapping[str, Any],
+    ) -> Tuple[
+        Optional[Mapping[str, Any]],
+        bool,
+    ]:
+        current: Any = response
+
+        success = bool(
+            response.get(
+                "success",
+                response.get(
+                    "ok",
+                    False,
+                ),
+            )
+        )
+
+        for _ in range(6):
+            if not isinstance(
+                current,
+                Mapping,
+            ):
+                break
+
+            relative = (
+                current.get(
+                    "relative_path"
+                )
+                or current.get(
+                    "filename"
+                )
+                or current.get(
+                    "path"
+                )
+            )
+
+            content = current.get(
+                "content"
+            )
+
+            if (
+                relative
+                and isinstance(
+                    content,
+                    str,
+                )
+            ):
+                local_success = bool(
+                    current.get(
+                        "success",
+                        current.get(
+                            "ok",
+                            success,
+                        ),
+                    )
+                )
+
+                return (
+                    current,
+                    local_success,
+                )
+
+            nested = current.get(
+                "result"
+            )
+
+            if not isinstance(
+                nested,
+                Mapping,
+            ):
+                break
+
+            success = bool(
+                nested.get(
+                    "success",
+                    nested.get(
+                        "ok",
+                        success,
+                    ),
+                )
+            )
+
+            current = nested
+
+        return None, success
+
+    @staticmethod
+    def _normalize_relative_path(
+        value: str,
+        allowed_root: str,
+    ) -> Optional[str]:
+        raw = str(
+            value or ""
+        ).strip()
+
+        if not raw:
+            return None
+
+        candidate = Path(raw)
+
+        if candidate.is_absolute():
+            return None
+
+        if ".." in candidate.parts:
+            return None
+
+        parts = [
+            part
+            for part in candidate.parts
+            if part not in {
+                "",
+                ".",
+            }
+        ]
+
+        if not parts:
+            return None
+
+        if parts[0] != allowed_root:
+            candidate = (
+                Path(allowed_root)
+                / Path(*parts)
+            )
+
+        try:
+            normalized = str(
+                candidate.as_posix()
+            )
+        except Exception:
+            return None
+
+        if (
+            normalized == allowed_root
+            or not normalized.startswith(
+                f"{allowed_root}/"
+            )
+        ):
+            return None
+
+        return normalized
 
     def propose(
         self,
@@ -1666,11 +1955,16 @@ class DevelopmentGateway:
         if not self.healthy():
             return None
 
-        response = self._json_request(
-            "POST",
-            "/v1/develop",
-            {
-                "objective": objective,
+        payload = {
+            "operation": "generate_code",
+            "objective": objective,
+            "language": "python",
+            "write": False,
+            "project_manifest": (
+                dict(project_manifest)
+            ),
+            "errors": list(errors),
+            "context": {
                 "project_manifest": (
                     dict(project_manifest)
                 ),
@@ -1686,45 +1980,128 @@ class DevelopmentGateway:
                     "production_quality": True,
                 },
             },
-        )
+            "constraints": {
+                "allowed_root": (
+                    allowed_root
+                ),
+                "no_secrets": True,
+                "no_shell_strings": True,
+                "no_security_bypass": True,
+                "complete_files_only": True,
+                "production_quality": True,
+            },
+        }
 
-        if not response.get("success"):
+        try:
+            response = self._json_request(
+                "POST",
+                "/v1/develop",
+                payload,
+                timeout=(
+                    self.development_timeout
+                ),
+            )
+
+        except Exception:
             return None
 
-        relative = str(
-            response.get(
-                "relative_path",
-                "",
+        extracted, success = (
+            self._extract_development_result(
+                response
             )
+        )
+
+        if (
+            not success
+            or extracted is None
+        ):
+            self.last_error = (
+                "INVALID_AI_DEVELOPMENT_RESULT"
+            )
+            return None
+
+        raw_relative = str(
+            extracted.get(
+                "relative_path"
+            )
+            or extracted.get(
+                "filename"
+            )
+            or extracted.get(
+                "path"
+            )
+            or ""
         ).strip()
 
-        content = response.get(
+        relative = (
+            self._normalize_relative_path(
+                raw_relative,
+                allowed_root,
+            )
+        )
+
+        content = extracted.get(
             "content"
         )
 
-        if not relative or not isinstance(
-            content,
-            str,
+        if (
+            relative is None
+            or not isinstance(
+                content,
+                str,
+            )
         ):
+            self.last_error = (
+                "INVALID_AI_GENERATED_FILE"
+            )
             return None
 
+        if (
+            len(
+                content.encode(
+                    "utf-8"
+                )
+            )
+            > MAX_GENERATED_FILE_BYTES
+        ):
+            self.last_error = (
+                "AI_GENERATED_FILE_TOO_LARGE"
+            )
+            return None
+
+        reason = (
+            extracted.get(
+                "reason"
+            )
+            or response.get(
+                "reason"
+            )
+            or objective
+        )
+
+        provider = (
+            extracted.get(
+                "provider"
+            )
+            or response.get(
+                "provider"
+            )
+            or "majd-ai-engine-03"
+        )
+
+        self.last_error = None
+
         return ChangeProposal(
-            proposal_id=new_id("proposal"),
-            change_type=ChangeType.CREATE,
+            proposal_id=new_id(
+                "proposal"
+            ),
+            change_type=(
+                ChangeType.CREATE
+            ),
             relative_path=relative,
             content=content,
-            reason=str(
-                response.get(
-                    "reason",
-                    objective,
-                )
-            ),
-            source=str(
-                response.get(
-                    "provider",
-                    "development-gateway",
-                )
-            ),
+            reason=str(reason),
+            source=str(provider),
         )
 
 
@@ -1910,7 +2287,6 @@ class ChangeManager:
 
                 return validation
 
-            # Automatic rollback.
             if backup is not None:
                 restored = (
                     self.backup_manager.restore(
@@ -2088,7 +2464,6 @@ class GitManager:
                 stderr="GIT_NOT_AVAILABLE",
             )
 
-        # Only generated/runtime-owned paths.
         add_result = self.runner.run(
             [
                 "git",
@@ -2433,10 +2808,15 @@ class AutonomousDeveloper:
             )
 
             if proposal is None:
+                gateway_error = (
+                    self.gateway.last_error
+                    or "DEVELOPMENT_GATEWAY_UNAVAILABLE"
+                )
+
                 result = ValidationResult(
                     success=False,
                     errors=[
-                        "DEVELOPMENT_GATEWAY_UNAVAILABLE"
+                        gateway_error
                     ],
                 )
 
@@ -2453,7 +2833,6 @@ class AutonomousDeveloper:
 
                 return result
 
-            # Enforce generated component root.
             proposal_path = Path(
                 proposal.relative_path
             )
@@ -2573,7 +2952,6 @@ class CapabilityDiscovery:
 
             gateways[name] = {
                 "configured": bool(value),
-                # Never persist secret/token.
                 "url_configured": bool(
                     value
                 ),
@@ -3143,6 +3521,12 @@ class MajdAutonomousRuntime:
             "development_gateway": (
                 self.gateway.healthy()
             ),
+            "development_gateway_error": (
+                self.gateway.last_error
+            ),
+            "development_gateway_timeout": (
+                self.gateway.development_timeout
+            ),
             "auto_dependencies": (
                 AUTO_INSTALL_DEPENDENCIES
             ),
@@ -3357,6 +3741,10 @@ def runtime_self_check() -> Dict[str, Any]:
         "database": False,
         "core_import": False,
         "constitution": False,
+        "development_timeout": (
+            DEVELOPMENT_GATEWAY_TIMEOUT
+            >= 60
+        ),
     }
 
     test_secret = (
@@ -3607,7 +3995,6 @@ def main() -> int:
 
             return 0
 
-        # Default behavior is continuous autonomous operation.
         return runtime.run_forever()
 
     except KeyboardInterrupt:

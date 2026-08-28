@@ -54,7 +54,7 @@ This runtime MUST NOT:
 
 - Disable CORE-01 security.
 - Remove user isolation.
-- expose credentials.
+- Expose credentials.
 - Print secrets.
 - Commit secrets.
 - Give itself arbitrary external privileges.
@@ -70,6 +70,31 @@ CORE-01 remains the sovereign policy authority.
 The runtime may create and evolve application components around the
 protected core, but changes must pass validation before activation.
 
+RUNTIME-02 <-> AI-ENGINE-03 CONTRACT
+------------------------------------
+Runtime 02 can use MAJD-ASSISTANT-AI-ENGINE-03.py as its development
+gateway.
+
+03 may return either:
+
+    {
+        "success": true,
+        "relative_path": "...",
+        "content": "..."
+    }
+
+or:
+
+    {
+        "success": true,
+        "result": {
+            "filename": "...",
+            "content": "..."
+        }
+    }
+
+Runtime 02 normalizes both formats safely.
+
 ============================================================
 """
 
@@ -77,16 +102,13 @@ from __future__ import annotations
 
 import argparse
 import ast
-import asyncio
 import contextlib
-import dataclasses
 import enum
 import hashlib
 import importlib.util
 import json
 import logging
 import os
-import py_compile
 import re
 import shutil
 import signal
@@ -126,10 +148,11 @@ APP_NAME = "MAJD Assistant"
 APP_NAME_AR = "مساعد مجد"
 
 RUNTIME_NAME = "MAJD Assistant Autonomous Runtime"
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.0.1"
 
 CORE_FILENAME = "MAJD-ASSISTANT-CORE-01.py"
 RUNTIME_FILENAME = "MAJD-ASSISTANT-AUTONOMOUS-RUNTIME-02.py"
+AI_ENGINE_FILENAME = "MAJD-ASSISTANT-AI-ENGINE-03.py"
 
 PROJECT_ROOT = Path(
     os.environ.get(
@@ -140,6 +163,7 @@ PROJECT_ROOT = Path(
 
 CORE_PATH = PROJECT_ROOT / CORE_FILENAME
 RUNTIME_PATH = PROJECT_ROOT / RUNTIME_FILENAME
+AI_ENGINE_PATH = PROJECT_ROOT / AI_ENGINE_FILENAME
 
 DATA_DIR = Path(
     os.environ.get(
@@ -194,6 +218,36 @@ MAX_REPAIR_ATTEMPTS = max(
 COMMAND_TIMEOUT = max(
     5,
     int(os.environ.get("MAJD_COMMAND_TIMEOUT", "180")),
+)
+
+# Development requests can involve local LLM generation and therefore
+# legitimately take several minutes. This replaces the old hard-coded
+# 60-second limit.
+DEVELOPMENT_GATEWAY_TIMEOUT = max(
+    60,
+    min(
+        3600,
+        int(
+            os.environ.get(
+                "MAJD_DEVELOPMENT_GATEWAY_TIMEOUT",
+                "600",
+            )
+        ),
+    ),
+)
+
+# Health checks must remain fast and independent from generation timeout.
+DEVELOPMENT_HEALTH_TIMEOUT = max(
+    2,
+    min(
+        60,
+        int(
+            os.environ.get(
+                "MAJD_DEVELOPMENT_HEALTH_TIMEOUT",
+                "10",
+            )
+        ),
+    ),
 )
 
 MAX_GENERATED_FILE_BYTES = max(
@@ -881,9 +935,7 @@ class CoreLoader:
     def load(self) -> Any:
         self.validate_exists()
 
-        module_name = (
-            "majd_assistant_core_01"
-        )
+        module_name = "majd_assistant_core_01"
 
         spec = importlib.util.spec_from_file_location(
             module_name,
@@ -1127,11 +1179,14 @@ class SourceValidator:
         try:
             tree = ast.parse(content)
             checks["ast_parse"] = True
+
         except SyntaxError as exc:
             checks["ast_parse"] = False
+
             errors.append(
                 f"SYNTAX_ERROR:{exc.lineno}:{exc.msg}"
             )
+
             return ValidationResult(
                 success=False,
                 checks=checks,
@@ -1283,6 +1338,7 @@ class ProjectValidator:
                 payload = json.loads(
                     result.stdout
                 )
+
                 checks["core"] = payload
 
                 return ValidationResult(
@@ -1298,6 +1354,7 @@ class ProjectValidator:
                         ]
                     ),
                 )
+
             except Exception:
                 pass
 
@@ -1366,14 +1423,8 @@ class ProjectValidator:
     def full_validation(
         self,
     ) -> ValidationResult:
-        compile_result = (
-            self.compile_project()
-        )
-
-        core_result = (
-            self.run_core_self_check()
-        )
-
+        compile_result = self.compile_project()
+        core_result = self.run_core_self_check()
         tests_result = self.run_tests()
 
         success = (
@@ -1385,9 +1436,7 @@ class ProjectValidator:
         return ValidationResult(
             success=success,
             checks={
-                "compile": (
-                    compile_result.checks
-                ),
+                "compile": compile_result.checks,
                 "core": core_result.checks,
                 "tests": tests_result.checks,
             },
@@ -1459,6 +1508,7 @@ class DependencyManager:
                     Risk.HIGH,
                     {"entry": line},
                 )
+
                 continue
 
             if not self.PACKAGE_RE.fullmatch(
@@ -1469,6 +1519,7 @@ class DependencyManager:
                     Risk.HIGH,
                     {"entry": line},
                 )
+
                 continue
 
             packages.append(line)
@@ -1548,13 +1599,18 @@ class DevelopmentGateway:
     Environment:
         MAJD_DEVELOPMENT_GATEWAY_URL
         MAJD_DEVELOPMENT_GATEWAY_TOKEN
+        MAJD_DEVELOPMENT_GATEWAY_TIMEOUT
+        MAJD_DEVELOPMENT_HEALTH_TIMEOUT
 
     Expected:
         GET  /health
         POST /v1/develop
 
-    The gateway proposes source code.
-    This runtime does not blindly trust it.
+    Compatible with MAJD-ASSISTANT-AI-ENGINE-03.py.
+
+    Runtime 02 never blindly trusts the returned source code.
+    Every proposal must still pass path, syntax, secret and full-project
+    validation before activation.
     """
 
     def __init__(self):
@@ -1568,6 +1624,16 @@ class DevelopmentGateway:
             "",
         )
 
+        self.development_timeout = (
+            DEVELOPMENT_GATEWAY_TIMEOUT
+        )
+
+        self.health_timeout = (
+            DEVELOPMENT_HEALTH_TIMEOUT
+        )
+
+        self.last_error: Optional[str] = None
+
     @property
     def configured(self) -> bool:
         return bool(self.base_url)
@@ -1575,6 +1641,7 @@ class DevelopmentGateway:
     def _headers(self) -> Dict[str, str]:
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "User-Agent": (
                 f"MAJD-Autonomous-Runtime/"
                 f"{RUNTIME_VERSION}"
@@ -1595,7 +1662,13 @@ class DevelopmentGateway:
         payload: Optional[
             Dict[str, Any]
         ] = None,
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
+        if not self.configured:
+            raise RuntimeError(
+                "DEVELOPMENT_GATEWAY_NOT_CONFIGURED"
+            )
+
         url = (
             f"{self.base_url}"
             f"{endpoint}"
@@ -1616,14 +1689,82 @@ class DevelopmentGateway:
             method=method,
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=60,
-        ) as response:
-            raw = response.read(
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else self.development_timeout
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=effective_timeout,
+            ) as response:
+                raw = response.read(
+                    MAX_GENERATED_FILE_BYTES
+                    + 500000
+                    + 1
+                )
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(
                 MAX_GENERATED_FILE_BYTES
                 + 500000
+                + 1
             )
+
+            detail = ""
+
+            with contextlib.suppress(
+                Exception
+            ):
+                parsed = json.loads(
+                    raw.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+                if isinstance(parsed, dict):
+                    detail = str(
+                        parsed.get(
+                            "error",
+                            parsed.get(
+                                "detail",
+                                "",
+                            ),
+                        )
+                    )
+
+            raise RuntimeError(
+                f"DEVELOPMENT_GATEWAY_HTTP_{exc.code}"
+                + (
+                    f":{SecretGuard.redact(detail)}"
+                    if detail
+                    else ""
+                )
+            ) from exc
+
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "DEVELOPMENT_GATEWAY_TIMEOUT:"
+                f"{effective_timeout}s"
+            ) from exc
+
+        except urllib.error.URLError as exc:
+            reason = SecretGuard.redact(
+                str(
+                    getattr(
+                        exc,
+                        "reason",
+                        exc,
+                    )
+                )
+            )
+
+            raise RuntimeError(
+                f"DEVELOPMENT_GATEWAY_CONNECTION_FAILED:{reason}"
+            ) from exc
 
         if (
             len(raw)
@@ -1634,24 +1775,115 @@ class DevelopmentGateway:
                 "Development response too large"
             )
 
-        return json.loads(
-            raw.decode("utf-8")
-        )
+        try:
+            result = json.loads(
+                raw.decode("utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "DEVELOPMENT_GATEWAY_INVALID_JSON"
+            ) from exc
+
+        if not isinstance(result, dict):
+            raise ValueError(
+                "DEVELOPMENT_GATEWAY_JSON_OBJECT_REQUIRED"
+            )
+
+        return result
 
     def healthy(self) -> bool:
+        self.last_error = None
+
         if not self.configured:
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_NOT_CONFIGURED"
+            )
             return False
 
         try:
             result = self._json_request(
                 "GET",
                 "/health",
+                timeout=self.health_timeout,
             )
-            return bool(
+
+            healthy = bool(
                 result.get("ok")
             )
-        except Exception:
+
+            if not healthy:
+                self.last_error = (
+                    "DEVELOPMENT_GATEWAY_HEALTH_FALSE"
+                )
+
+            return healthy
+
+        except Exception as exc:
+            self.last_error = (
+                SecretGuard.redact(
+                    f"{type(exc).__name__}: {exc}"
+                )
+            )
+
             return False
+
+    @staticmethod
+    def _normalize_relative_path(
+        raw_path: str,
+        allowed_root: str,
+    ) -> Optional[str]:
+        value = str(
+            raw_path or ""
+        ).strip()
+
+        if not value:
+            return None
+
+        # Normalize Windows separators returned by models.
+        value = value.replace(
+            "\\",
+            "/",
+        )
+
+        candidate = Path(value)
+
+        if candidate.is_absolute():
+            return None
+
+        if ".." in candidate.parts:
+            return None
+
+        if not candidate.parts:
+            return None
+
+        allowed = Path(
+            allowed_root
+        )
+
+        if (
+            not allowed.parts
+            or allowed.is_absolute()
+            or ".." in allowed.parts
+        ):
+            return None
+
+        # 03 may return only "component.py". Runtime 02 owns generated
+        # components under majd_generated, so safely prefix the root.
+        if candidate.parts[0] != allowed.parts[0]:
+            candidate = (
+                allowed
+                / candidate
+            )
+
+        normalized = candidate.as_posix()
+
+        if not normalized.startswith(
+            allowed.as_posix().rstrip("/")
+            + "/"
+        ):
+            return None
+
+        return normalized
 
     def propose(
         self,
@@ -1663,14 +1895,28 @@ class DevelopmentGateway:
         errors: Sequence[str],
         allowed_root: str = "majd_generated",
     ) -> Optional[ChangeProposal]:
+        self.last_error = None
+
         if not self.healthy():
             return None
 
-        response = self._json_request(
-            "POST",
-            "/v1/develop",
-            {
-                "objective": objective,
+        # 03 expects an explicit code-generation operation.
+        # The project state/errors are supplied through context because
+        # AI-ENGINE-03 consumes that field as development context.
+        payload = {
+            "operation": "generate_code",
+            "objective": (
+                objective
+                + "\n\n"
+                + "Create or repair one complete production-quality "
+                + "component required to advance this objective. "
+                + f"The returned filename must be inside {allowed_root}/. "
+                + "Return the complete file, not a patch. "
+                + "Do not claim tests or execution that were not performed."
+            ),
+            "language": "python",
+            "write": False,
+            "context": {
                 "project_manifest": (
                     dict(project_manifest)
                 ),
@@ -1684,47 +1930,157 @@ class DevelopmentGateway:
                     "no_security_bypass": True,
                     "complete_files_only": True,
                     "production_quality": True,
+                    "preserve_core_security": True,
                 },
             },
-        )
+        }
+
+        try:
+            response = self._json_request(
+                "POST",
+                "/v1/develop",
+                payload,
+                timeout=self.development_timeout,
+            )
+
+        except Exception as exc:
+            self.last_error = (
+                SecretGuard.redact(
+                    f"{type(exc).__name__}: {exc}"
+                )
+            )
+
+            return None
 
         if not response.get("success"):
+            self.last_error = str(
+                response.get(
+                    "error",
+                    "DEVELOPMENT_GATEWAY_RETURNED_FAILURE",
+                )
+            )
+
             return None
 
-        relative = str(
-            response.get(
-                "relative_path",
-                "",
-            )
-        ).strip()
+        # ----------------------------------------------------
+        # COMPATIBILITY:
+        #
+        # Old MAJD-compatible contract:
+        #   response["relative_path"]
+        #   response["content"]
+        #
+        # AI-ENGINE-03 contract:
+        #   response["result"]["filename"]
+        #   response["result"]["content"]
+        # ----------------------------------------------------
 
-        content = response.get(
-            "content"
+        nested = response.get(
+            "result"
         )
 
-        if not relative or not isinstance(
-            content,
-            str,
+        if not isinstance(
+            nested,
+            dict,
         ):
+            nested = {}
+
+        raw_relative = (
+            response.get(
+                "relative_path"
+            )
+            or response.get(
+                "filename"
+            )
+            or nested.get(
+                "relative_path"
+            )
+            or nested.get(
+                "filename"
+            )
+            or ""
+        )
+
+        content = (
+            response.get(
+                "content"
+            )
+            if isinstance(
+                response.get("content"),
+                str,
+            )
+            else nested.get(
+                "content"
+            )
+        )
+
+        relative = (
+            self._normalize_relative_path(
+                str(raw_relative),
+                allowed_root,
+            )
+        )
+
+        if not relative:
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_MISSING_OR_INVALID_PATH"
+            )
+
             return None
 
+        if not isinstance(
+            content,
+            str,
+        ) or not content.strip():
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_MISSING_CONTENT"
+            )
+
+            return None
+
+        if len(
+            content.encode("utf-8")
+        ) > MAX_GENERATED_FILE_BYTES:
+            self.last_error = (
+                "DEVELOPMENT_GATEWAY_CONTENT_TOO_LARGE"
+            )
+
+            return None
+
+        reason = str(
+            response.get(
+                "reason"
+            )
+            or response.get(
+                "summary"
+            )
+            or nested.get(
+                "summary"
+            )
+            or objective
+        )
+
+        provider = str(
+            response.get(
+                "provider"
+            )
+            or response.get(
+                "engine"
+            )
+            or response.get(
+                "model"
+            )
+            or "MAJD-AI-ENGINE-03"
+        )
+
         return ChangeProposal(
-            proposal_id=new_id("proposal"),
+            proposal_id=new_id(
+                "proposal"
+            ),
             change_type=ChangeType.CREATE,
             relative_path=relative,
             content=content,
-            reason=str(
-                response.get(
-                    "reason",
-                    objective,
-                )
-            ),
-            source=str(
-                response.get(
-                    "provider",
-                    "development-gateway",
-                )
-            ),
+            reason=reason,
+            source=provider,
         )
 
 
@@ -1740,9 +2096,7 @@ class ChangeManager:
         validator: ProjectValidator,
     ):
         self.db = db
-        self.backup_manager = (
-            backup_manager
-        )
+        self.backup_manager = backup_manager
         self.validator = validator
 
     def _target(
@@ -1761,7 +2115,9 @@ class ChangeManager:
             path.relative_to(
                 PROJECT_ROOT.resolve()
             )
+
             return True
+
         except ValueError:
             return False
 
@@ -1910,13 +2266,13 @@ class ChangeManager:
 
                 return validation
 
-            # Automatic rollback.
             if backup is not None:
                 restored = (
                     self.backup_manager.restore(
                         backup
                     )
                 )
+
             elif not existed_before:
                 with contextlib.suppress(
                     FileNotFoundError
@@ -1924,6 +2280,7 @@ class ChangeManager:
                     target.unlink()
 
                 restored = not target.exists()
+
             else:
                 restored = False
 
@@ -1961,11 +2318,13 @@ class ChangeManager:
                         backup
                     )
                 )
+
             elif not existed_before:
                 with contextlib.suppress(
                     FileNotFoundError
                 ):
                     target.unlink()
+
                 restored = True
 
             return ValidationResult(
@@ -2088,7 +2447,6 @@ class GitManager:
                 stderr="GIT_NOT_AVAILABLE",
             )
 
-        # Only generated/runtime-owned paths.
         add_result = self.runner.run(
             [
                 "git",
@@ -2315,6 +2673,7 @@ class ProjectManifest:
 
             try:
                 size = path.stat().st_size
+
             except OSError:
                 continue
 
@@ -2362,6 +2721,17 @@ class ProjectManifest:
                         RUNTIME_PATH
                     )
                     if RUNTIME_PATH.exists()
+                    else None
+                ),
+            },
+            "ai_engine": {
+                "file": AI_ENGINE_FILENAME,
+                "exists": AI_ENGINE_PATH.exists(),
+                "sha256": (
+                    sha256_file(
+                        AI_ENGINE_PATH
+                    )
+                    if AI_ENGINE_PATH.exists()
                     else None
                 ),
             },
@@ -2433,10 +2803,15 @@ class AutonomousDeveloper:
             )
 
             if proposal is None:
+                gateway_error = (
+                    self.gateway.last_error
+                    or "DEVELOPMENT_GATEWAY_NO_PROPOSAL"
+                )
+
                 result = ValidationResult(
                     success=False,
                     errors=[
-                        "DEVELOPMENT_GATEWAY_UNAVAILABLE"
+                        gateway_error
                     ],
                 )
 
@@ -2451,9 +2826,19 @@ class AutonomousDeveloper:
                     },
                 )
 
+                self.db.event(
+                    "AUTONOMOUS_DEVELOPMENT_BLOCKED",
+                    Risk.HIGH,
+                    {
+                        "attempt": attempt,
+                        "gateway_error": (
+                            gateway_error
+                        ),
+                    },
+                )
+
                 return result
 
-            # Enforce generated component root.
             proposal_path = Path(
                 proposal.relative_path
             )
@@ -2481,6 +2866,7 @@ class AutonomousDeveloper:
                 )
 
                 errors = result.errors
+
                 continue
 
             result = self.changes.apply(
@@ -2573,7 +2959,6 @@ class CapabilityDiscovery:
 
             gateways[name] = {
                 "configured": bool(value),
-                # Never persist secret/token.
                 "url_configured": bool(
                     value
                 ),
@@ -2628,12 +3013,21 @@ class CapabilityDiscovery:
                     "MAJD_DEVELOPMENT_GATEWAY_URL"
                 )
             ),
+            "local_ai_engine_present": (
+                AI_ENGINE_PATH.exists()
+            ),
         }
 
         return {
             "time": utc_now(),
             "gateways": gateways,
             "capabilities": capabilities,
+            "development_timeout_seconds": (
+                DEVELOPMENT_GATEWAY_TIMEOUT
+            ),
+            "development_health_timeout_seconds": (
+                DEVELOPMENT_HEALTH_TIMEOUT
+            ),
         }
 
 
@@ -2677,6 +3071,11 @@ class HealthEngine:
                 "constitution_fingerprint": (
                     self.core_loader
                     .constitution_fingerprint()
+                ),
+            },
+            "ai_engine": {
+                "exists": (
+                    AI_ENGINE_PATH.exists()
                 ),
             },
             "validation": {
@@ -2751,9 +3150,7 @@ class MaintenanceEngine:
     ):
         self.db = db
         self.health = health
-        self.dependencies = (
-            dependencies
-        )
+        self.dependencies = dependencies
         self.developer = developer
         self.git = git
         self.deployer = deployer
@@ -3077,6 +3474,10 @@ class MajdAutonomousRuntime:
 
         self._write_manifest()
 
+        gateway_healthy = (
+            self.gateway.healthy()
+        )
+
         result = {
             "ok": validation.success,
             "runtime": RUNTIME_NAME,
@@ -3084,6 +3485,9 @@ class MajdAutonomousRuntime:
                 RUNTIME_VERSION
             ),
             "core_file": CORE_FILENAME,
+            "ai_engine_file": (
+                AI_ENGINE_FILENAME
+            ),
             "core_self_check": (
                 self_check
             ),
@@ -3103,7 +3507,15 @@ class MajdAutonomousRuntime:
             },
             "autonomous": True,
             "development_gateway": (
-                self.gateway.healthy()
+                gateway_healthy
+            ),
+            "development_gateway_error": (
+                None
+                if gateway_healthy
+                else self.gateway.last_error
+            ),
+            "development_gateway_timeout": (
+                DEVELOPMENT_GATEWAY_TIMEOUT
             ),
             "auto_dependencies": (
                 AUTO_INSTALL_DEPENDENCIES
@@ -3185,9 +3597,11 @@ class MajdAutonomousRuntime:
 
         logger.info(
             "Autonomous runtime active. "
-            "heartbeat=%ss maintenance=%ss",
+            "heartbeat=%ss maintenance=%ss "
+            "development_timeout=%ss",
             HEARTBEAT_SECONDS,
             MAINTENANCE_SECONDS,
+            DEVELOPMENT_GATEWAY_TIMEOUT,
         )
 
         last_maintenance = 0.0
@@ -3303,6 +3717,9 @@ def runtime_self_check() -> Dict[str, Any]:
             RUNTIME_PATH.exists()
         ),
         "core_file": CORE_PATH.exists(),
+        "ai_engine_file": (
+            AI_ENGINE_PATH.exists()
+        ),
         "directories": all(
             directory.exists()
             for directory in (
@@ -3319,6 +3736,10 @@ def runtime_self_check() -> Dict[str, Any]:
         "database": False,
         "core_import": False,
         "constitution": False,
+        "development_timeout": (
+            DEVELOPMENT_GATEWAY_TIMEOUT
+            >= 60
+        ),
     }
 
     test_secret = (
@@ -3569,7 +3990,6 @@ def main() -> int:
 
             return 0
 
-        # Default behavior is continuous autonomous operation.
         return runtime.run_forever()
 
     except KeyboardInterrupt:

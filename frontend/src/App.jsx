@@ -1,0 +1,142 @@
+import { useEffect, useState } from 'react';
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+
+function App() {
+  const [games, setGames] = useState([]);
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [stats, setStats] = useState({});
+
+  useEffect(() => {
+    fetch(`${API_URL}/api/games`)
+      .then((res) => res.json())
+      .then((data) => setGames(data.data || []))
+      .catch(() => setGames([]));
+
+    fetch(`${API_URL}/api/leaderboard`)
+      .then((res) => res.json())
+      .then((data) => setLeaderboard(data.data || []))
+      .catch(() => setLeaderboard([]));
+
+    fetch(`${API_URL}/api/admin/stats`)
+      .then((res) => res.json())
+      .then((data) => setStats(data.data || {}))
+      .catch(() => setStats({}));
+  }, []);
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand-block">
+          <div className="brand-badge">M</div>
+          <div>
+            <div className="small-label">MAJD GAMES</div>
+            <h1>منصة الألعاب</h1>
+          </div>
+        </div>
+
+        <nav className="nav-actions">
+          <button>الرئيسية</button>
+          <button>الألعاب</button>
+          <button>المتجر</button>
+          <button>لوحة التحكم</button>
+        </nav>
+
+        <div className="user-box">
+          <span>MajdPlayer</span>
+        </div>
+      </header>
+
+      <main className="content-wrap">
+        <section className="hero-panel">
+          <div className="hero-copy">
+            <span className="tag">AI Gaming Platform</span>
+            <h2>ألعاب حقيقية، ذكية، ومطورة باستمرار</h2>
+            <p>
+              توليد ألعاب متقدمة، تجارب واقعية، ومحتوى متغير يدعم كل مراحل اللعب والتطور.
+            </p>
+            <div className="hero-actions">
+              <button className="primary">تصفح الألعاب</button>
+              <button className="secondary">إنشاء لعبة</button>
+            </div>
+          </div>
+
+          <div className="hero-card">
+            <div className="mini-panel">
+              <div className="stat-item">
+                <span>قوة</span>
+                <strong>94%</strong>
+              </div>
+              <div className="stat-item">
+                <span>مستخدمون</span>
+                <strong>{stats.activePlayers || 14840}</strong>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="stats-grid">
+          <div className="stat-box">
+            <span>إجمالي المستخدمين</span>
+            <strong>{stats.totalUsers || 1284}</strong>
+          </div>
+          <div className="stat-box">
+            <span>الألعاب</span>
+            <strong>{stats.totalGames || 46}</strong>
+          </div>
+          <div className="stat-box">
+            <span>التحميلات</span>
+            <strong>{stats.totalDownloads || 160000}</strong>
+          </div>
+          <div className="stat-box">
+            <span>الإيرادات</span>
+            <strong>{stats.revenue || '$245K'}</strong>
+          </div>
+        </section>
+
+        <section className="games-panel">
+          <div className="section-header">
+            <h3>ألعاب مختارة</h3>
+            <button>عرض الكل</button>
+          </div>
+
+          <div className="games-grid">
+            {games.map((game) => (
+              <article key={game.id} className="game-card">
+                <img src={game.bannerUrl} alt={game.title} />
+                <div className="game-meta">
+                  <span className="category">{game.category}</span>
+                  <span className="rating">★ {game.rating}</span>
+                </div>
+                <h4>{game.title}</h4>
+                <p>{game.description}</p>
+                <div className="game-footer">
+                  <strong>{game.price}$</strong>
+                  <button>تشغيل</button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="leaderboard-panel">
+          <div className="section-header">
+            <h3>لوحة المتصدرين</h3>
+          </div>
+
+          <div className="leaderboard-list">
+            {leaderboard.map((entry, index) => (
+              <div key={entry.name} className="leader-row">
+                <span className="place">#{index + 1}</span>
+                <span className="player-name">{entry.name}</span>
+                <strong>{entry.score}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+export default App;

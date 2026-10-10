@@ -1,0 +1,83 @@
+import './styles.css';
+
+const games = [
+  { title: 'Dragon Slayer', category: 'RPG', status: 'published', revenue: '$24,800', players: '18.4K' },
+  { title: 'Sky Command', category: 'Strategy', status: 'published', revenue: '$18,200', players: '12.8K' },
+  { title: 'Pixel Origins', category: 'Adventure', status: 'draft', revenue: '$6,900', players: '7.2K' }
+];
+
+export default function App() {
+  return (
+    <div className="admin-shell">
+      <div className="admin-grid">
+        <aside className="sidebar">
+          <h2>MAJD Admin</h2>
+          <div className="nav-list">
+            <button className="nav-item">Dashboard</button>
+            <button className="nav-item">Games</button>
+            <button className="nav-item">Users</button>
+            <button className="nav-item">Revenue</button>
+            <button className="nav-item">AI Studio</button>
+          </div>
+        </aside>
+
+        <main className="main-panel">
+          <div className="top-row">
+            <div>
+              <h1>Dashboard</h1>
+              <p>Overview of the MAJD gaming platform</p>
+            </div>
+            <button>Generate New Game</button>
+          </div>
+
+          <div className="stats-row">
+            <div className="stat-card">
+              <span>Total Users</span>
+              <h3>12,845</h3>
+            </div>
+            <div className="stat-card">
+              <span>Active Players</span>
+              <h3>9,460</h3>
+            </div>
+            <div className="stat-card">
+              <span>Revenue</span>
+              <h3>$245K</h3>
+            </div>
+            <div className="stat-card">
+              <span>AI Jobs</span>
+              <h3>26</h3>
+            </div>
+          </div>
+
+          <div className="table-actions">
+            <h3>Games</h3>
+            <button>Export</button>
+          </div>
+
+          <table className="games-table">
+            <thead>
+              <tr>
+                <th>Game</th>
+                <th>Category</th>
+                <th>Status</th>
+                <th>Players</th>
+                <th>Revenue</th>
+              </tr>
+            </thead>
+            <tbody>
+              {games.map((game) => (
+                <tr key={game.title}>
+                  <td>{game.title}</td>
+                  <td>{game.category}</td>
+                  <td><span className="badge">{game.status}</span></td>
+                  <td>{game.players}</td>
+                  <td>{game.revenue}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </main>
+      </div>
+    </div>
+  );
+}

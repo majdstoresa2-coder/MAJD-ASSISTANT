@@ -1,0 +1,63 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: majd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: majd_games
+      POSTGRES_USER: majd
+      POSTGRES_PASSWORD: majd123
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  backend:
+    build: ./backend
+    container_name: majd-backend
+    restart: unless-stopped
+    environment:
+      PORT: 4000
+      NODE_ENV: development
+      DATABASE_URL: postgres://majd:majd123@postgres:5432/majd_games
+    ports:
+      - '4000:4000'
+    depends_on:
+      - postgres
+
+  ai-engine:
+    build: ./ai-engine
+    container_name: majd-ai-engine
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+    ports:
+      - '8000:8000'
+
+  frontend:
+    build: ./frontend
+    container_name: majd-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:4000
+    ports:
+      - '5173:5173'
+    depends_on:
+      - backend
+
+  admin:
+    build: ./admin
+    container_name: majd-admin
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:4000
+    ports:
+      - '4173:4173'
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

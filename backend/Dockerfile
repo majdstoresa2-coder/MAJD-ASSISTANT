@@ -1,38 +1,16 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import os
+FROM node:20-alpine
 
-app = FastAPI(title='MAJD AI Engine')
+WORKDIR /app
 
-class GenerateRequest(BaseModel):
-    concept: str = 'Fantasy action RPG'
-    category: str = 'RPG'
+COPY package*.json ./
 
-@app.get('/health')
-def health():
-    return {
-        'ok': True,
-        'service': 'majd-ai-engine',
-        'port': int(os.getenv('PORT', '8000'))
-    }
+RUN npm install
 
-@app.post('/api/ai/generate')
-def generate(req: GenerateRequest):
-    return {
-        'success': True,
-        'concept': req.concept,
-        'category': req.category,
-        'title': 'Eclipse Dominion',
-        'summary': 'A cinematic world with strategic combat, town building, and AI-driven story evolution.',
-        'status': 'generated',
-        'confidence': 0.96,
-        'generated_assets': {
-            'characters': ['Heroic Knight', 'Shadow Mage', 'Ancient Guardian'],
-            'biomes': ['Frozen Ruins', 'Sunfire Outpost', 'Sky Citadel'],
-            'mechanics': ['guild raids', 'upgrade loops', 'dynamic events']
-        }
-    }
+COPY . .
 
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '8000')))
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:4000/api/health', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})" || exit 1
+
+CMD ["node", "server.js"]
